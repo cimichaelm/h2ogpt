@@ -20,6 +20,11 @@ pipeline {
 //        git ''
 //      }
 //    }
+    stage('Prepare Build') {
+      steps {
+        sh 'touch build_info.txt'
+      }
+    }
     stage('Building image') {
       steps{
         script {
@@ -40,7 +45,7 @@ pipeline {
     }
     stage('Remove Unused docker image') {
       steps{
-        sh "docker rmi ${env.imagename}"
+        sh "docker rmi ${env.imagename"}
       }
     }
   }
