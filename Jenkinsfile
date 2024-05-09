@@ -22,7 +22,8 @@ pipeline {
 //    }
     stage('Prepare Build') {
       steps {
-        sh 'touch build_info.txt'
+        sh 'git rev-parse HEAD > git_hash.txt'
+        sh 'touch build_info.txt'	
       }
     }
     stage('Building image') {
