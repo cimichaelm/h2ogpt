@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent
 import difflib
+import re
 import threading
 import traceback
 import os
@@ -37,9 +38,10 @@ class ReturnType(BaseModel):
     prompt_raw: str | None
     actual_llm: str | None
     text_context_list: list[str] | None = []
-    input_tokens: Optional[int] = None
-    output_tokens: Optional[int] = None
-    tokens_per_second: Optional[float] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    tokens_per_second: float = 0.0
+    time_to_first_token: float = 0.0
 
 
 try:
@@ -106,6 +108,11 @@ class GradioClient(Client):
     To handle automatically refreshing client if detect gradio server changed
     """
 
+    def reset_session(self) -> None:
+        self.session_hash = str(uuid.uuid4())
+        if hasattr(self, "include_heartbeat") and self.include_heartbeat:
+            self._refresh_heartbeat.set()
+
     def __init__(
         self,
         src: str,
@@ -122,11 +129,11 @@ class GradioClient(Client):
         download_files: bool = True,  # TODO: consider setting to False in 1.0
         _skip_components: bool = True,  # internal parameter to skip values certain components (e.g. State) that do not need to be displayed to users.
         ssl_verify: bool = True,
-
         h2ogpt_key: str = None,
         persist: bool = False,
         check_hash: bool = True,
         check_model_name: bool = False,
+        include_heartbeat: bool = False,
     ):
         """
         Parameters:
@@ -154,6 +161,7 @@ class GradioClient(Client):
             persist=persist,
             check_hash=check_hash,
             check_model_name=check_model_name,
+            include_heartbeat=include_heartbeat,
         )
         if is_gradio_client_version7plus:
             # 4.18.0:
@@ -163,7 +171,14 @@ class GradioClient(Client):
             # 4.24.0:
             self._skip_components = _skip_components
             self.ssl_verify = ssl_verify
-            self.kwargs.update(dict(auth=auth, upload_files=upload_files, download_files=download_files, ssl_verify=ssl_verify))
+            self.kwargs.update(
+                dict(
+                    auth=auth,
+                    upload_files=upload_files,
+                    download_files=download_files,
+                    ssl_verify=ssl_verify,
+                )
+            )
 
         self.verbose = verbose
         self.hf_token = hf_token
@@ -193,6 +208,7 @@ class GradioClient(Client):
         self.persist = persist
         self.check_hash = check_hash
         self.check_model_name = check_model_name
+        self.include_heartbeat = include_heartbeat
 
         self.chat_conversation = []  # internal for persist=True
         self.server_hash = None  # internal
@@ -256,12 +272,15 @@ class GradioClient(Client):
         self.api_url = urllib.parse.urljoin(self.src, utils.API_URL)
         if is_gradio_client_version7plus:
             self.protocol: Literal[
-            "ws", "sse", "sse_v1", "sse_v2", "sse_v2.1"
+                "ws", "sse", "sse_v1", "sse_v2", "sse_v2.1"
             ] = self.config.get("protocol", "ws")
             self.sse_url = urllib.parse.urljoin(
                 self.src, utils.SSE_URL_V0 if self.protocol == "sse" else utils.SSE_URL
             )
-            self.heartbeat_url = urllib.parse.urljoin(self.src, utils.HEARTBEAT_URL)
+            if hasattr(utils, "HEARTBEAT_URL") and self.include_heartbeat:
+                self.heartbeat_url = urllib.parse.urljoin(self.src, utils.HEARTBEAT_URL)
+            else:
+                self.heartbeat_url = None
             self.sse_data_url = urllib.parse.urljoin(
                 self.src,
                 utils.SSE_DATA_URL_V0 if self.protocol == "sse" else utils.SSE_DATA_URL,
@@ -280,11 +299,17 @@ class GradioClient(Client):
 
         # Disable telemetry by setting the env variable HF_HUB_DISABLE_TELEMETRY=1
         # threading.Thread(target=self._telemetry_thread, daemon=True).start()
-        if is_gradio_client_version7plus:
+        if (
+            is_gradio_client_version7plus
+            and hasattr(utils, "HEARTBEAT_URL")
+            and self.include_heartbeat
+        ):
             self._refresh_heartbeat = threading.Event()
             self._kill_heartbeat = threading.Event()
 
-            self.heartbeat = threading.Thread(target=self._stream_heartbeat, daemon=True)
+            self.heartbeat = threading.Thread(
+                target=self._stream_heartbeat, daemon=True
+            )
             self.heartbeat.start()
 
         self.server_hash = self.get_server_hash()
@@ -329,22 +354,33 @@ class GradioClient(Client):
         if verbose:
             print("duration endpoints: %s" % (time.time() - t0), flush=True)
 
+    @staticmethod
+    def is_full_git_hash(s):
+        # This regex checks for exactly 40 hexadecimal characters.
+        return bool(re.fullmatch(r"[0-9a-f]{40}", s))
+
     def get_server_hash(self):
-        t0 = time.time()
-        if self.config is None:
-            self.setup()
         """
         Get server hash using super without any refresh action triggered
         Returns: git hash of gradio server
         """
+        t0 = time.time()
+        if self.config is None:
+            self.setup()
+        t1 = time.time()
+        ret = "GET_GITHASH_UNSET"
         try:
             if self.check_hash:
-                return super().submit(api_name="/system_hash").result()
-            else:
-                return "GET_GITHASH"
+                ret = super().submit(api_name="/system_hash").result()
+                assert self.is_full_git_hash(ret), f"ret is not a full git hash: {ret}"
+            return ret
         finally:
             if self.verbose:
-                print("duration server_hash: %s" % (time.time() - t0), flush=True)
+                print(
+                    "duration server_hash: %s full time: %s system_hash time: %s"
+                    % (ret, time.time() - t0, time.time() - t1),
+                    flush=True,
+                )
 
     def refresh_client_if_should(self):
         if self.config is None:
@@ -382,11 +418,13 @@ class GradioClient(Client):
         kwargs.pop("persist", None)
         kwargs.pop("check_hash", None)
         kwargs.pop("check_model_name", None)
+        kwargs.pop("include_heartbeat", None)
         ntrials = 3
         client = None
-        for trial in range(0, ntrials + 1):
+        for trial in range(0, ntrials):
             try:
                 client = Client(*self.args, **kwargs)
+                break
             except ValueError as e:
                 if trial >= ntrials:
                     raise
@@ -584,7 +622,29 @@ class GradioClient(Client):
                 ).items()
             }
             diff = set(eval_func_param_names).difference(fun_kwargs)
-            assert len(diff) == 0, "Add entries: %s" % diff
+            assert len(diff) == 0, (
+                "Add query_or_summarize_or_extract entries: %s" % diff
+            )
+
+            extra_query_params = [
+                "file",
+                "bad_error_string",
+                "print_info",
+                "asserts",
+                "url",
+                "prompt_extraction",
+                "model",
+                "text",
+                "print_error",
+                "pre_prompt_extraction",
+                "embed",
+                "print_warning",
+                "sanitize_llm",
+            ]
+            diff = set(fun_kwargs).difference(
+                eval_func_param_names + extra_query_params
+            )
+            assert len(diff) == 0, "Add eval_func_params entries: %s" % diff
 
         return client_kwargs
 
@@ -629,6 +689,11 @@ class GradioClient(Client):
         pre_prompt_extraction: str | None = pre_prompt_extraction0,
         prompt_extraction: str | None = prompt_extraction0,
         hyde_llm_prompt: str | None = hyde_llm_prompt0,
+        user_prompt_for_fake_system_prompt: str = None,
+        json_object_prompt: str = None,
+        json_object_prompt_simpler: str = None,
+        json_code_prompt: str = None,
+        json_schema_instruction: str = None,
         model: str | int | None = None,
         stream_output: bool = False,
         do_sample: bool = False,
@@ -656,17 +721,14 @@ class GradioClient(Client):
         metadata_in_context: list = [],
         image_file: Union[str, list] = None,
         image_control: str = None,
-
-        response_format: str = 'text',
-        guided_json: Union[str, dict] = '',
-        guided_regex: str = '',
-        guided_choice: str = '',
-        guided_grammar: str = '',
-
+        response_format: str = "text",
+        guided_json: Union[str, dict] = "",
+        guided_regex: str = "",
+        guided_choice: str = "",
+        guided_grammar: str = "",
         prompt_type: Union[int, str] = None,
         prompt_dict: Dict = None,
         jq_schema=".[]",
-        llava_model: str = None,
         llava_prompt: str = "auto",
         image_audio_loaders: list = None,
         url_loaders: list = None,
@@ -679,15 +741,16 @@ class GradioClient(Client):
         tts_speed: float = 1.0,
         visible_image_models: List[str] = [],
         visible_models: Union[str, int, list] = None,
-        num_return_sequences: int = None,  # don't use
-        chat: bool = True,  # don't use
-        min_new_tokens: int = None,  # don't use
-        early_stopping: Union[bool, str] = None,  # don't use
-        iinput: str = "",  # don't use
-        iinput_nochat: str = "",  # don't use
-        instruction_nochat: str = "",  # don't use
-        context: str = "",  # don't use
-        num_beams: int = 1,  # don't use
+        # don't use the below (no doc string stuff) block
+        num_return_sequences: int = None,
+        chat: bool = True,
+        min_new_tokens: int = None,
+        early_stopping: Union[bool, str] = None,
+        iinput: str = "",
+        iinput_nochat: str = "",
+        instruction_nochat: str = "",
+        context: str = "",
+        num_beams: int = 1,
         asserts: bool = False,
     ) -> Generator[ReturnType, None, None]:
         """
@@ -712,31 +775,31 @@ class GradioClient(Client):
             url: a url to give or urls to use
             embed: whether to embed content uploaded
 
-            langchain_mode: "LLM" to talk to LLM with no docs, "MyData" for personal docs, "UserData" for shared docs, etc.
-            langchain_action: Action to take, "Query" or "Summarize" or "Extract"
-            langchain_agents: Which agents to use, if any
-            top_k_docs: number of document parts.
+            :param langchain_mode: "LLM" to talk to LLM with no docs, "MyData" for personal docs, "UserData" for shared docs, etc.
+            :param langchain_action: Action to take, "Query" or "Summarize" or "Extract"
+            :param langchain_agents: Which agents to use, if any
+            :param top_k_docs: number of document parts.
                         When doing query, number of chunks
                         When doing summarization, not related to vectorDB chunks that are not used
                         E.g. if PDF, then number of pages
-            chunk: whether to chunk sources for document Q/A
-            chunk_size: Size in characters of chunks
-            document_choice: Which documents ("All" means all) -- need to use upload_api API call to get server's name if want to select
-            document_subset: Type of query, see src/gen.py
-            document_source_substrings: See gen.py
-            document_source_substrings_op: See gen.py
-            document_content_substrings: See gen.py
-            document_content_substrings_op: See gen.py
+            :param chunk: whether to chunk sources for document Q/A
+            :param chunk_size: Size in characters of chunks
+            :param document_choice: Which documents ("All" means all) -- need to use upload_api API call to get server's name if want to select
+            :param document_subset: Type of query, see src/gen.py
+            :param document_source_substrings: See gen.py
+            :param document_source_substrings_op: See gen.py
+            :param document_content_substrings: See gen.py
+            :param document_content_substrings_op: See gen.py
 
-            system_prompt: pass system prompt to models that support it.
+            :param system_prompt: pass system prompt to models that support it.
               If 'auto' or None, then use automatic version
               If '', then use no system prompt (default)
-            pre_prompt_query: Prompt that comes before document part
-            prompt_query: Prompt that comes after document part
-            pre_prompt_summary: Prompt that comes before document part
+            :param pre_prompt_query: Prompt that comes before document part
+            :param prompt_query: Prompt that comes after document part
+            :param pre_prompt_summary: Prompt that comes before document part
                None makes h2oGPT internally use its defaults
                E.g. "In order to write a concise single-paragraph or bulleted list summary, pay attention to the following text"
-            prompt_summary: Prompt that comes after document part
+            :param prompt_summary: Prompt that comes after document part
               None makes h2oGPT internally use its defaults
               E.g. "Using only the text above, write a condensed and concise summary of key results (preferably as bullet points):\n"
             i.e. for some internal document part fstring, the template looks like:
@@ -745,53 +808,59 @@ class GradioClient(Client):
                 %s
                 \"\"\"
                 %s" % (pre_prompt_summary, fstring, prompt_summary)
-            hyde_llm_prompt: hyde prompt for first step when using LLM
-            h2ogpt_key: Access Key to h2oGPT server (if not already set in client at init time)
-            model: base_model name or integer index of model_lock on h2oGPT server
+            :param hyde_llm_prompt: hyde prompt for first step when using LLM
+
+            :param user_prompt_for_fake_system_prompt: user part of pre-conversation if LLM doesn't handle system prompt
+            :param json_object_prompt: prompt for getting LLM to do JSON object
+            :param json_object_prompt_simpler: simpler of "" for MistralAI
+            :param json_code_prompt: prompt for getting LLm to do JSON in code block
+            :param json_schema_instruction: prompt for LLM to use schema
+
+            :param h2ogpt_key: Access Key to h2oGPT server (if not already set in client at init time)
+            :param model: base_model name or integer index of model_lock on h2oGPT server
                             None results in use of first (0th index) model in server
                    to get list of models do client.list_models()
-            pre_prompt_extraction: Same as pre_prompt_summary but for when doing extraction
-            prompt_extraction: Same as prompt_summary but for when doing extraction
-            do_sample: see src/gen.py
-            seed: see src/gen.py
-            temperature: see src/gen.py
-            top_p: see src/gen.py
-            top_k: see src/gen.py
-            repetition_penalty: see src/gen.py
-            penalty_alpha: see src/gen.py
-            max_new_tokens: see src/gen.py
-            min_max_new_tokens: see src/gen.py
-            max_input_tokens: see src/gen.py
-            max_total_input_tokens: see src/gen.py
-            stream_output: Whether to stream output
-            max_time: how long to take
+            :param pre_prompt_extraction: Same as pre_prompt_summary but for when doing extraction
+            :param prompt_extraction: Same as prompt_summary but for when doing extraction
+            :param do_sample: see src/gen.py
+            :param seed: see src/gen.py
+            :param temperature: see src/gen.py
+            :param top_p: see src/gen.py
+            :param top_k: see src/gen.py
+            :param repetition_penalty: see src/gen.py
+            :param penalty_alpha: see src/gen.py
+            :param max_new_tokens: see src/gen.py
+            :param min_max_new_tokens: see src/gen.py
+            :param max_input_tokens: see src/gen.py
+            :param max_total_input_tokens: see src/gen.py
+            :param stream_output: Whether to stream output
+            :param max_time: how long to take
 
-            add_search_to_context: Whether to do web search and add results to context
-            chat_conversation: List of tuples for (human, bot) conversation that will be pre-appended to an (instruction, None) case for a query
-            text_context_list: List of strings to add to context for non-database version of document Q/A for faster handling via API etc.
+            :param add_search_to_context: Whether to do web search and add results to context
+            :param chat_conversation: List of tuples for (human, bot) conversation that will be pre-appended to an (instruction, None) case for a query
+            :param text_context_list: List of strings to add to context for non-database version of document Q/A for faster handling via API etc.
                Forces LangChain code path and uses as many entries in list as possible given max_seq_len, with first assumed to be most relevant and to go near prompt.
-            docs_ordering_type: By default uses 'reverse_ucurve_sort' for optimal retrieval
-            max_input_tokens: Max input tokens to place into model context for each LLM call
+            :param docs_ordering_type: By default uses 'reverse_ucurve_sort' for optimal retrieval
+            :param max_input_tokens: Max input tokens to place into model context for each LLM call
                                      -1 means auto, fully fill context for query, and fill by original document chunk for summarization
                                      >=0 means use that to limit context filling to that many tokens
-            max_total_input_tokens: like max_input_tokens but instead of per LLM call, applies across all LLM calls for single summarization/extraction action
-            max_new_tokens: Maximum new tokens
-            min_max_new_tokens: minimum value for max_new_tokens when auto-adjusting for content of prompt, docs, etc.
+            :param max_total_input_tokens: like max_input_tokens but instead of per LLM call, applies across all LLM calls for single summarization/extraction action
+            :param max_new_tokens: Maximum new tokens
+            :param min_max_new_tokens: minimum value for max_new_tokens when auto-adjusting for content of prompt, docs, etc.
 
-            docs_token_handling: 'chunk' means fill context with top_k_docs (limited by max_input_tokens or model_max_len) chunks for query
+            :param docs_token_handling: 'chunk' means fill context with top_k_docs (limited by max_input_tokens or model_max_len) chunks for query
                                                                              or top_k_docs original document chunks summarization
                                         None or 'split_or_merge' means same as 'chunk' for query, while for summarization merges documents to fill up to max_input_tokens or model_max_len tokens
-            docs_joiner: string to join lists of text when doing split_or_merge.  None means '\n\n'
-            hyde_level: 0-3 for HYDE.
+            :param docs_joiner: string to join lists of text when doing split_or_merge.  None means '\n\n'
+            :param hyde_level: 0-3 for HYDE.
                         0 uses just query to find similarity with docs
                         1 uses query + pure LLM response to find similarity with docs
                         2: uses query + LLM response using docs to find similarity with docs
                         3+: etc.
-            hyde_template: see src/gen.py
-            hyde_show_only_final: see src/gen.py
-            doc_json_mode: see src/gen.py
-            metadata_in_context: see src/gen.py
-
+            :param hyde_template: see src/gen.py
+            :param hyde_show_only_final: see src/gen.py
+            :param doc_json_mode: see src/gen.py
+            :param metadata_in_context: see src/gen.py
 
             :param image_file: Initial image for UI (or actual image for CLI) Vision Q/A.  Or list of images for some models
             :param image_control: Initial image for UI Image Control
@@ -812,9 +881,6 @@ class GradioClient(Client):
 
             :param extract_frames: How many unique frames to extract from video (if 0, then just do audio if audio type file as well)
 
-            :param llava_model:  IP:port for h2oai version of LLaVa gradio server for hosted image chat
-                   E.g. http://192.168.1.46:7861
-                   None means no such LLaVa support
             :param llava_prompt: Prompt passed to LLaVa for querying the image
 
             :param image_audio_loaders: which loaders to use for image and audio parsing (None means default)
@@ -840,7 +906,7 @@ class GradioClient(Client):
                       and the value is not used to access the inference server.
                       If need a visible_models for an inference server, then use --model_lock and group together.
 
-            asserts: whether to do asserts to ensure handling is correct
+            :param asserts: whether to do asserts to ensure handling is correct
 
         Returns: summary/answer: str or extraction List[str]
 
@@ -948,6 +1014,8 @@ class GradioClient(Client):
         texts_out = []
         trials = 3
         t0 = time.time()
+        time_to_first_token = None
+        t_taken_s = None
         for trial in range(trials):
             t0 = time.time()
             try:
@@ -956,6 +1024,8 @@ class GradioClient(Client):
                         str(dict(client_kwargs)),
                         api_name=api_name,
                     )
+                    if time_to_first_token is None:
+                        time_to_first_token = time.time() - t0
                     t_taken_s = time.time() - t0
                     # in case server changed, update in case clone()
                     self.server_hash = client.server_hash
@@ -971,9 +1041,7 @@ class GradioClient(Client):
                     prompt_raw = res_dict.get("prompt_raw", "")
 
                     try:
-                        actual_llm = res_dict["save_dict"][
-                            "base_model"
-                        ]  # fast path
+                        actual_llm = res_dict["save_dict"]["base_model"]  # fast path
                     except Exception as e:
                         print_warning(
                             f"Unable to access save_dict to get actual_llm: {str(e)}"
@@ -994,7 +1062,7 @@ class GradioClient(Client):
                     except:
                         if os.getenv("HARD_ASSERTS"):
                             raise
-                        input_tokens = output_tokens = tokens_per_second = None
+                        input_tokens = output_tokens = tokens_per_second = 0
                     if asserts:
                         if text and not file and not url:
                             assert any(
@@ -1011,6 +1079,7 @@ class GradioClient(Client):
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         tokens_per_second=tokens_per_second,
+                        time_to_first_token=time_to_first_token,
                     )
 
                     self.chat_conversation[-1] = (instruction, response)
@@ -1029,19 +1098,28 @@ class GradioClient(Client):
                             prompt_raw = res_dict.get(
                                 "prompt_raw", ""
                             )  # only filled at end
-                            text_chunk = response[len(text0) :]  # only keep new stuff
+                            if prompt_raw:
+                                if langchain_action != LangChainAction.EXTRACT.value:
+                                    text_chunk = response.strip()
+                                else:
+                                    text_chunk = [r.strip() for r in ast.literal_eval(response)]
+                            else:
+                                text_chunk = response[len(text0) :]  # only keep new stuff
                             if not text_chunk:
                                 time.sleep(0.001)
                                 continue
                             text0 = response
                             assert text_chunk, "must yield non-empty string"
+                            if time_to_first_token is None:
+                                time_to_first_token = time.time() - t0
                             yield ReturnType(
                                 reply=text_chunk,
                                 text_context_list=texts_out,
                                 prompt_raw=prompt_raw,
                                 actual_llm=actual_llm,
+                                time_to_first_token=time_to_first_token,
                             )
-                        time.sleep(0.01)
+                        time.sleep(0.005)
 
                     # Get final response (if anything left), but also get the actual references (texts_out), above is empty.
                     res_all = job.outputs().copy()
@@ -1074,26 +1152,25 @@ class GradioClient(Client):
                         texts_out = [x["content"] for x in sources]
                         t_taken_s = time.time() - t0
                         t_taken = "%.4f" % t_taken_s
-                        if langchain_action != LangChainAction.EXTRACT.value:
-                            if not (response.strip()):
-                                actual_llm = (
-                                    sanitize_llm(visible_models)
-                                    if sanitize_llm is not None
-                                    else visible_models
-                                )
-                                raise TimeoutError(
-                                    f"No output from LLM {actual_llm} after {t_taken} seconds."
-                                )
+
+                        if prompt_raw:
+                            if langchain_action != LangChainAction.EXTRACT.value:
+                                text_chunk = response.strip()
+                            else:
+                                text_chunk = [r.strip() for r in ast.literal_eval(response)]
                         else:
-                            if not all(r.strip() for r in ast.literal_eval(response)):
-                                actual_llm = (
-                                    sanitize_llm(visible_models)
-                                    if sanitize_llm is not None
-                                    else visible_models
-                                )
-                                raise TimeoutError(
-                                    f"No output from LLM {actual_llm} after {t_taken} seconds."
-                                )
+                            text_chunk = response[len(text0) :]  # only keep new stuff
+
+                        if not text_chunk:
+                            actual_llm = (
+                                sanitize_llm(visible_models)
+                                if sanitize_llm is not None
+                                else visible_models
+                            )
+                            raise TimeoutError(
+                                f"No output from LLM {actual_llm} after {t_taken} seconds."
+                            )
+
                         try:
                             extra_dict = res_dict["save_dict"]["extra_dict"]
                             input_tokens = extra_dict["num_prompt_tokens"]
@@ -1104,7 +1181,7 @@ class GradioClient(Client):
                         except:
                             if os.getenv("HARD_ASSERTS"):
                                 raise
-                            input_tokens = output_tokens = tokens_per_second = None
+                            input_tokens = output_tokens = tokens_per_second = 0
 
                         try:
                             actual_llm = res_dict["save_dict"][
@@ -1123,14 +1200,17 @@ class GradioClient(Client):
                         if text_context_list:
                             assert texts_out, "No texts_out 1"
 
+                        if time_to_first_token is None:
+                            time_to_first_token = time.time() - t0
                         yield ReturnType(
-                            reply=response[len(text0) :],
+                            reply=text_chunk,
                             text_context_list=texts_out,
                             prompt_raw=prompt_raw,
                             actual_llm=actual_llm,
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
                             tokens_per_second=tokens_per_second,
+                            time_to_first_token=time_to_first_token,
                         )
 
                         self.chat_conversation[-1] = (
@@ -1152,14 +1232,17 @@ class GradioClient(Client):
                     # no need to do 3 trials if have disallowed stuff, unlikely that LLM will change its mind
                     raise
                 if trial == trials - 1:
+                    print_error("trying again failed: %s" % trial)
                     raise
                 else:
                     # both Anthopic and openai gives this kind of error, but h2oGPT only has retries for OpenAI
-                    if 'Overloaded' in str(traceback.format_tb(e.__traceback__)):
+                    if "Overloaded" in str(traceback.format_tb(e.__traceback__)):
                         sleep_time = 30 + 2 ** (trial + 1)
                     else:
                         sleep_time = 1 * trial
-                    print_warning("trying again: %s in %s seconds" % (trial, sleep_time))
+                    print_warning(
+                        "trying again: %s in %s seconds" % (trial, sleep_time)
+                    )
                     time.sleep(sleep_time)
             finally:
                 # in case server changed, update in case clone()
@@ -1229,7 +1312,7 @@ class GradioClient(Client):
         prompt="",
         prompter=None,
         sanitize_bot_response=False,
-        max_time=None,
+        max_time=300,
         is_public=False,
         raise_exception=True,
         verbose=False,
@@ -1260,11 +1343,14 @@ class GradioClient(Client):
                 res_dict = ast.literal_eval(res)
                 text = res_dict["response"]
                 prompt_and_text = prompt + text
-                response = prompter.get_response(
-                    prompt_and_text,
-                    prompt=prompt,
-                    sanitize_bot_response=sanitize_bot_response,
-                )
+                if prompter:
+                    response = prompter.get_response(
+                        prompt_and_text,
+                        prompt=prompt,
+                        sanitize_bot_response=sanitize_bot_response,
+                    )
+                else:
+                    response = text
                 text_chunk = response[len(text0) :]
                 if not text_chunk:
                     # just need some sleep for threads to switch
@@ -1272,15 +1358,14 @@ class GradioClient(Client):
                     continue
                 # save old
                 text0 = response
-                yield dict(
-                    response=response,
-                    sources=sources,
-                    save_dict={},
-                    llm_answers={},
-                    response_no_refs=response,
-                    sources_str="",
-                    prompt_raw="",
+                res_dict.update(
+                    dict(
+                        response=response,
+                        error=strex,
+                        response_no_refs=response,
+                    )
                 )
+                yield res_dict
                 if time.time() - tgen0 > max_time:
                     if verbose:
                         print(
@@ -1288,7 +1373,7 @@ class GradioClient(Client):
                             flush=True,
                         )
                     break
-            time.sleep(0.01)
+            time.sleep(0.005)
         # ensure get last output to avoid race
         res_all = job.outputs().copy()
         success = job.communicator.job.latest_status.success
@@ -1327,15 +1412,21 @@ class GradioClient(Client):
                 flush=True,
             )
         prompt_and_text = prompt + text
-        response = prompter.get_response(
-            prompt_and_text, prompt=prompt, sanitize_bot_response=sanitize_bot_response
+        if prompter:
+            response = prompter.get_response(
+                prompt_and_text,
+                prompt=prompt,
+                sanitize_bot_response=sanitize_bot_response,
+            )
+        else:
+            response = text
+        res_dict.update(
+            dict(
+                response=response,
+                error=strex,
+                response_no_refs=response,
+            )
         )
-        res_dict.update(dict(
-            response=response,
-            sources=sources,
-            error=strex,
-            response_no_refs=response,
-        ))
         yield res_dict
         return res_dict
 
@@ -1513,5 +1604,5 @@ class GradioClient(Client):
             return res_dict, text0
         if do_yield:
             yield res_dict
-            time.sleep(0.01)
+            time.sleep(0.005)
         return res_dict, text0

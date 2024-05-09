@@ -141,6 +141,13 @@ def get_args(prompt, prompt_type=None, chat=False, stream_output=False,
                          pre_prompt_summary=None,
                          prompt_summary=None,
                          hyde_llm_prompt=None,
+
+                         user_prompt_for_fake_system_prompt=None,
+                         json_object_prompt=None,
+                         json_object_prompt_simpler=None,
+                         json_code_prompt=None,
+                         json_schema_instruction=None,
+
                          system_prompt=system_prompt,
                          image_audio_loaders=None,
                          pdf_loaders=None,
@@ -454,7 +461,7 @@ def run_client_chat(prompt='',
 def run_client(client, prompt, args, kwargs, do_md_to_text=True, verbose=False):
     if is_gradio_version4:
         kwargs['answer_with_sources'] = True
-        kwargs['show_accordions'] = True
+        kwargs['sources_show_text_in_accordion'] = True
         kwargs['append_sources_to_answer'] = True
         kwargs['append_sources_to_chat'] = False
         kwargs['show_link_in_sources'] = True

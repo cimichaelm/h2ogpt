@@ -8,11 +8,11 @@ torch==2.2.1; sys_platform == "darwin" and platform_machine == "arm64"
 #langchain-core==0.1.10
 
 # optional for chat with PDF
-langchain==0.1.14
-langchain_experimental==0.0.56
-langchain-community==0.0.31
-langsmith==0.1.38
-langchain-core==0.1.40
+langchain==0.1.16
+langchain_experimental==0.0.57
+langchain-community==0.0.33
+langsmith==0.1.48
+langchain-core==0.1.43
 langchain-text-splitters==0.0.1
 
 pypdf>=3.17.1
@@ -31,8 +31,11 @@ langchain-anthropic==0.1.6
 langchain-google-genai==1.0.1
 google-generativeai==0.4.1
 
-langchain_mistralai==0.1.0
+#langchain_mistralai==0.1.2  # tokenizers<0.16.0, but transformers requires >=0.19
+httpx>=0.25.2
+httpx-sse>=0.3.1
 mistralai==0.1.8
+mistral-common==1.0.2
 
 groq==0.4.2
 langchain-groq==0.1.0
@@ -45,7 +48,7 @@ chroma-migrate==0.0.7
 duckdb==0.7.1
 chromamigdb @ https://h2o-release.s3.amazonaws.com/h2ogpt/chromamigdb-0.3.26-py3-none-any.whl
 hnswmiglib @ https://h2o-release.s3.amazonaws.com/h2ogpt/hnswmiglib-0.7.0.tgz
-pydantic-settings==2.1.0
+pydantic-settings>=2.1.0
 
 # server vector db
 #pymilvus==2.2.8

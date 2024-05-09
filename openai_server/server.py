@@ -74,6 +74,13 @@ class H2oGPTParams(BaseModel):
     pre_prompt_summary: str | None = None
     prompt_summary: str | None = None
     hyde_llm_prompt: str | None = None
+
+    user_prompt_for_fake_system_prompt: str | None = None
+    json_object_prompt: str | None = None
+    json_object_prompt_simpler: str | None = None
+    json_code_prompt: str | None = None
+    json_schema_instruction: str | None = None
+
     system_prompt: str | None = 'auto'
 
     image_audio_loaders: List | None = None
@@ -343,7 +350,7 @@ def run_server(host='0.0.0.0',
                guest_name='',
                ):
     os.environ['GRADIO_PREFIX'] = gradio_prefix or 'http'
-    os.environ['GRADIO_SERVER_HOST'] = gradio_host or 'localhost'
+    os.environ['GRADIO_SERVER_HOST'] = gradio_host or '127.0.0.1'
     os.environ['GRADIO_SERVER_PORT'] = gradio_port or '7860'
     os.environ['GRADIO_H2OGPT_H2OGPT_KEY'] = h2ogpt_key or ''  # don't use H2OGPT_H2OGPT_KEY, mixes things up
     # use h2ogpt_key if no server api key, so OpenAI inherits key by default if any keys set and enforced via API for h2oGPT
